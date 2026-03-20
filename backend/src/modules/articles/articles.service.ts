@@ -1,0 +1,1424 @@
+import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+import { AiClientService } from '../ai-models/ai-client.service';
+import { DefaultModelsService } from '../ai-models/default-models.service';
+import { SystemLogsService } from '../system-logs/system-logs.service';
+import { ImageSelectorService } from './image-selector.service';
+import { MaterialsService } from '../materials/materials.service';
+import { QiniuService } from '../storage/qiniu.service';
+import {
+    renderXiaohongshuCardSvg,
+    XiaohongshuSlideRole,
+    XiaohongshuSlideTemplate,
+} from './xiaohongshu-card-renderer';
+import sharp from 'sharp';
+
+function withTimeout<T>(promise: Promise<T>, ms: number, msg: string): Promise<T> {
+    return Promise.race([
+        promise,
+        new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(msg)), ms)
+        ),
+    ]);
+}
+
+type ArticleContentFormat = 'markdown' | 'html';
+type ArticleContentType = 'article' | 'xiaohongshu';
+
+type GeneratedArticlePayload = {
+    title: string;
+    content: string;
+    contentFormat: ArticleContentFormat;
+};
+
+type XiaohongshuSlidePlan = {
+    role: XiaohongshuSlideRole;
+    template: XiaohongshuSlideTemplate;
+    title: string;
+    body: string;
+    bullets: string[];
+    highlight: string;
+    imagePrompt: string;
+    imageType: 'real' | 'ai' | 'none';
+};
+
+type GeneratedXiaohongshuPayload = {
+    title: string;
+    caption: string;
+    hashtags: string[];
+    slides: XiaohongshuSlidePlan[];
+};
+
+type XiaohongshuSlide = XiaohongshuSlidePlan & {
+    coverText: string;
+    bodyText: string;
+    imageUrl: string | null;
+    backgroundImageUrl: string | null;
+    cardImageUrl: string;
+};
+
+type XiaohongshuNoteData = {
+    title: string;
+    caption: string;
+    hashtags: string[];
+    slides: XiaohongshuSlide[];
+};
+
+type MaterialInfo = {
+    id: string;
+    imageUrl: string | null;
+    originalImageUrl: string | null;
+    hasImage: boolean;
+    title: string;
+    content: string | null;
+};
+
+type ImageTaskResult = {
+    placeholder: string;
+    url: string | null;
+    success: boolean;
+    errorDetail?: string;
+};
+
+const ARTICLE_GENERATION_TIMEOUT_MS = 20 * 60 * 1000;
+const ARTICLE_MAX_GENERATION_ATTEMPTS = 3;
+const ARTICLE_MARKDOWN_MAX_TOKENS = 4000;
+const ARTICLE_HTML_MAX_TOKENS = 12000;
+const ARTICLE_HTML_CONTINUATION_MAX_TOKENS = 6000;
+
+type HtmlValidationResult = {
+    isComplete: boolean;
+    reason: string;
+};
+
+@Injectable()
+export class ArticlesService {
+    private readonly logger = new Logger(ArticlesService.name);
+
+    constructor(
+        private readonly prisma: PrismaService,
+        private readonly aiClient: AiClientService,
+        private readonly defaultModels: DefaultModelsService,
+        private readonly systemLogsService: SystemLogsService,
+        private readonly imageSelector: ImageSelectorService,
+        private readonly materialsService: MaterialsService,
+        private readonly qiniuService: QiniuService,
+    ) { }
+
+    // ================= 核心：一键图文文生成引擎 =================
+    async generateFromTopic(topicId: string, force = false, contentType: ArticleContentType = 'article') {
+        let topic = await this.prisma.topic.findUnique({
+            where: { id: topicId },
+            include: { materials: { include: { material: true } } },
+        });
+
+        if (!topic) {
+            throw new HttpException('选题不存在', HttpStatus.NOT_FOUND);
+        }
+        if (topic.isPublished && !force) {
+            throw new HttpException(`该选题已完成过${this.getContentLabel(contentType)}创作`, HttpStatus.BAD_REQUEST);
+        }
+
+        if (topic.materials.length > 0) {
+            await this.materialsService.ensureImagesForMaterials(topic.materials.map((m) => m.material.id));
+            topic = await this.prisma.topic.findUnique({
+                where: { id: topicId },
+                include: { materials: { include: { material: true } } },
+            });
+            if (!topic) {
+                throw new HttpException('选题不存在', HttpStatus.NOT_FOUND);
+            }
+        }
+
+        await this.prisma.topic.update({
+            where: { id: topicId },
+            data: { status: 'generating' },
+        });
+
+        try {
+            return await withTimeout(
+                (async () => {
+                    const [articleStyle, imageStyle, articleTemplate] = await Promise.all([
+                        this.prisma.style.findFirst({ where: { isDefault: true, type: contentType === 'xiaohongshu' ? 'xiaohongshu' : 'article' } }),
+                        this.prisma.style.findFirst({ where: { isDefault: true, type: 'image' } }),
+                        contentType === 'article'
+                            ? this.prisma.style.findFirst({ where: { isDefault: true, type: 'template' } })
+                            : Promise.resolve(null),
+                    ]);
+
+                    const stylePrompt = articleStyle?.promptTemplate || this.getDefaultStylePrompt(contentType);
+                    const templateHtml = articleTemplate?.promptTemplate?.trim() || '';
+                    const templateNotes = this.readTemplateNotes(articleTemplate?.parameters);
+                    const contentFormat: ArticleContentFormat = contentType === 'article' && templateHtml ? 'html' : 'markdown';
+
+                    const config = await this.defaultModels.getDefaults();
+                    if (!config.articleCreation) {
+                        throw new HttpException('未配置文章创作默认 AI 模型', HttpStatus.BAD_REQUEST);
+                    }
+                    if (!config.imageCreation) {
+                        this.logger.warn('未配置图片创作模型，可能无法生成插图');
+                    }
+
+                    const materialContents = topic.materials
+                        .map((m, i) => `【参考素材 ${i + 1}】标题：${m.material.title}\n真实配图：${m.material.hasImage && m.material.imageUrl ? '有可复用原图' : '暂无可用原图'}\n内容详情：${m.material.content?.substring(0, 800) || m.material.summary || ''}`)
+                        .join('\n\n');
+
+                    const startMsg = `开始为选题「${topic.title}」生成${contentType === 'xiaohongshu' ? '小红书笔记' : contentFormat === 'html' ? 'HTML 模板文章' : 'Markdown 文章'}... (模型: ${config.articleCreation})`;
+                    this.logger.log(startMsg);
+                    await this.systemLogsService.record(startMsg, 'info');
+
+                    const materialInfos: MaterialInfo[] = topic.materials.map((m) => ({
+                        id: m.material.id,
+                        imageUrl: m.material.imageUrl,
+                        originalImageUrl: m.material.originalImageUrl,
+                        hasImage: m.material.hasImage,
+                        title: m.material.title,
+                        content: m.material.content,
+                    }));
+
+                    const imageStylePrompt = imageStyle?.promptTemplate;
+                    const imageStyleParams = (imageStyle?.parameters as { ratio?: string; resolution?: string } | null) || undefined;
+
+                    if (contentType === 'xiaohongshu') {
+                        const xiaohongshuData = await this.generateXiaohongshuNote({
+                            modelId: config.articleCreation,
+                            stylePrompt,
+                            topicTitle: topic.title,
+                            topicSummary: topic.summary || '',
+                            keywords: topic.keywords,
+                            materialContents,
+                            materialInfos,
+                            imageStylePrompt,
+                            imageStyleParams,
+                            imageCreationEnabled: Boolean(config.imageCreation),
+                        });
+
+                        const newArticle = await this.prisma.article.create({
+                            data: {
+                                title: xiaohongshuData.title,
+                                content: this.buildXiaohongshuContent(xiaohongshuData.caption, xiaohongshuData.hashtags),
+                                contentType,
+                                contentFormat: 'markdown',
+                                xiaohongshuData,
+                                coverImage: xiaohongshuData.slides[0]?.cardImageUrl || xiaohongshuData.slides[0]?.imageUrl || null,
+                                status: 'draft',
+                                topicId: topic.id,
+                                styleId: articleStyle?.id,
+                                templateId: null,
+                                modelId: config.articleCreation,
+                            }
+                        });
+
+                        await this.prisma.topic.update({
+                            where: { id: topic.id },
+                            data: {
+                                status: 'completed',
+                                isPublished: true,
+                            }
+                        });
+
+                        const successMsg = `${this.getContentLabel(contentType)}「${xiaohongshuData.title}」生成顺利完成`;
+                        this.logger.log(`${this.getContentLabel(contentType)}生成顺利完成。记录号: ${newArticle.id}`);
+                        await this.systemLogsService.record(successMsg, 'success');
+                        return newArticle;
+                    }
+
+                    const articleData = await this.generateArticlePayload({
+                        modelId: config.articleCreation,
+                        systemPrompt: this.buildSystemPrompt(contentType, stylePrompt, contentFormat, templateHtml, templateNotes),
+                        userPrompt: this.buildUserPrompt({
+                            contentType,
+                            topicTitle: topic.title,
+                            topicSummary: topic.summary || '',
+                            keywords: topic.keywords,
+                            materialContents,
+                            templateNotes,
+                        }),
+                        fallbackTitle: topic.title,
+                        contentFormat,
+                        templateHtml,
+                    });
+
+                    const renderedResult = await this.renderImages({
+                        content: articleData.content,
+                        contentFormat,
+                        materialInfos,
+                        imageStylePrompt,
+                        imageStyleParams,
+                        imageCreationEnabled: Boolean(config.imageCreation),
+                        topicTitle: topic.title,
+                    });
+                    const coverImage = await this.generateCoverImage({
+                        topicTitle: topic.title,
+                        topicSummary: topic.summary || '',
+                        keywords: topic.keywords,
+                        imageStylePrompt,
+                        imageStyleParams,
+                        imageCreationEnabled: Boolean(config.imageCreation),
+                    });
+
+                    const newArticle = await this.prisma.article.create({
+                        data: {
+                            title: articleData.title,
+                            content: renderedResult.content,
+                            contentType,
+                            contentFormat,
+                            rawHtml: contentFormat === 'html' ? articleData.content : null,
+                            finalHtml: contentFormat === 'html' ? renderedResult.content : null,
+                            coverImage,
+                            status: 'draft',
+                            topicId: topic.id,
+                            styleId: articleStyle?.id,
+                            templateId: articleTemplate?.id,
+                            modelId: config.articleCreation,
+                        }
+                    });
+
+                    await this.prisma.topic.update({
+                        where: { id: topic.id },
+                        data: {
+                            status: 'completed',
+                            isPublished: true,
+                        }
+                    });
+
+                    const successMsg = `${this.getContentLabel(contentType)}「${articleData.title}」生成顺利完成`;
+                    this.logger.log(`${this.getContentLabel(contentType)}生成顺利完成。记录号: ${newArticle.id}`);
+                    await this.systemLogsService.record(successMsg, 'success');
+                    return newArticle;
+                })(),
+                ARTICLE_GENERATION_TIMEOUT_MS,
+                `${this.getContentLabel(contentType)}生成超时（超过20分钟），请稍后重试`
+            );
+        } catch (error) {
+            const message = error instanceof Error ? error.message : '系统内部打分执行中断';
+            const errorMsg = `${this.getContentLabel(contentType)}「${topic.title}」一键生成过程出错了: ${message}`;
+            this.logger.error(`${this.getContentLabel(contentType)}一键生成过程出错了`, error);
+            await this.systemLogsService.record(errorMsg, 'error');
+            await this.prisma.topic.update({
+                where: { id: topicId },
+                data: { status: 'completed' }
+            });
+            throw new HttpException(message, HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    // ================= 批量操作：定时任务按门槛生成草稿 =================
+    async batchGenerateDrafts(limit: number = 5, minScore: number = 80) {
+        this.logger.log(`开始执行批量生成草稿任务，寻找 AI 评分 >= ${minScore} 的待处理选题，最多处理 ${limit} 个...`);
+
+        const topics = await this.prisma.topic.findMany({
+            where: {
+                status: 'completed',
+                isPublished: false,
+                aiScore: { gte: minScore }
+            },
+            orderBy: {
+                aiScore: 'desc'
+            },
+            take: limit
+        });
+
+        if (topics.length === 0) {
+            this.logger.log('当前没有符合生成门槛的待处理选题。');
+            return { processed: 0, message: '无符合条件选题' };
+        }
+
+        let successCount = 0;
+        let failCount = 0;
+        const generatedArticleIds: string[] = [];
+
+        for (const topic of topics) {
+            try {
+                this.logger.log(`>>> 批量生成进度: 正在处理选题 「${topic.title}」 (分数: ${topic.aiScore})`);
+                const article = await this.generateFromTopic(topic.id, false);
+                generatedArticleIds.push(article.id);
+                successCount++;
+            } catch (err) {
+                const message = err instanceof Error ? err.message : '未知错误';
+                this.logger.error(`批量生成「${topic.title}」失败: ${message}`);
+                failCount++;
+            }
+        }
+
+        const msg = `批量文章生成完毕。成功: ${successCount}，失败: ${failCount}。`;
+        this.logger.log(msg);
+        if (successCount > 0) {
+            await this.systemLogsService.record(msg, 'success');
+        }
+        return { processed: topics.length, successCount, failCount, message: msg, generatedArticleIds };
+    }
+
+    // ============== 常规 CRUD ===============
+    async findAll(query: Record<string, string | number | undefined>) {
+        const { page = 1, limit = 10, keyword, status, contentType } = query;
+        const skip = (Number(page) - 1) * Number(limit);
+
+        const whereCondition: Record<string, unknown> = {};
+
+        if (keyword) {
+            whereCondition.OR = [
+                { title: { contains: keyword } },
+                { content: { contains: keyword } },
+                { rawHtml: { contains: keyword } },
+                { finalHtml: { contains: keyword } },
+            ];
+        }
+
+        if (status && status !== 'all') {
+            whereCondition.status = status;
+        }
+
+        if (contentType && contentType !== 'all') {
+            whereCondition.contentType = contentType;
+        }
+
+        const [items, total] = await Promise.all([
+            this.prisma.article.findMany({
+                where: whereCondition,
+                skip,
+                take: Number(limit),
+                orderBy: { createdAt: 'desc' },
+                include: {
+                    topic: { select: { title: true, keywords: true } },
+                    template: { select: { id: true, name: true } },
+                }
+            }),
+            this.prisma.article.count({ where: whereCondition }),
+        ]);
+
+        return {
+            items,
+            total,
+            page: Number(page),
+            limit: Number(limit),
+            totalPages: Math.ceil(total / Number(limit)),
+        };
+    }
+
+    async findOne(id: string) {
+        return this.prisma.article.findUnique({
+            where: { id },
+            include: {
+                topic: { select: { title: true, keywords: true } },
+                template: { select: { id: true, name: true } },
+            },
+        });
+    }
+
+    async update(id: string, data: { title?: string; content?: string; rawHtml?: string; finalHtml?: string; contentFormat?: ArticleContentFormat }) {
+        const currentArticle = await this.prisma.article.findUnique({ where: { id } });
+        if (!currentArticle) {
+            throw new HttpException('文章不存在', HttpStatus.NOT_FOUND);
+        }
+
+        const nextFormat = data.contentFormat || currentArticle.contentFormat as ArticleContentFormat;
+        const nextContent = data.content ?? data.finalHtml ?? currentArticle.content;
+        const isHtmlArticle = nextFormat === 'html';
+
+        return this.prisma.article.update({
+            where: { id },
+            data: {
+                title: data.title,
+                content: nextContent,
+                contentFormat: nextFormat,
+                rawHtml: data.rawHtml ?? currentArticle.rawHtml,
+                finalHtml: isHtmlArticle ? (data.finalHtml ?? data.content ?? currentArticle.finalHtml ?? nextContent) : null,
+            }
+        });
+    }
+
+    async remove(id: string) {
+        return this.prisma.article.delete({ where: { id } });
+    }
+
+    private buildSystemPrompt(
+        contentType: ArticleContentType,
+        stylePrompt: string,
+        contentFormat: ArticleContentFormat,
+        templateHtml: string,
+        templateNotes: string,
+    ): string {
+        if (contentType === 'xiaohongshu') {
+            return `你现在是一个专业的小红书内容策划与爆款笔记写手，熟悉种草、经验总结、避坑清单、观点表达和互动转化。
+
+【你的写作风格要求】：
+${stylePrompt}
+
+【小红书笔记写作要求】：
+1. 这是“文字排版优先、图片辅助”的多图卡片笔记，不要把它写成长文章。
+2. 一共输出 6 到 7 张卡片，默认适配 3:4 竖版成品卡图。
+3. 第 1 张必须是封面大字报，模板固定为 \`cover-poster\`，主标题要强利益点、强冲突或强结果感。
+4. 第 2 到第 6/7 张必须使用固定模板集合：\`insight-card\`、\`bullet-list\`、\`checklist-card\`、\`summary-card\`。
+5. 每张卡片都必须返回：
+- \`role\`：\`cover\` / \`hook\` / \`problem\` / \`solution\` / \`method\` / \`summary\` / \`cta\`
+- \`template\`：固定模板名，必须从上面的模板集合里选
+- \`title\`：卡片主标题，控制在 8 到 18 个字
+- \`body\`：卡片主体说明，控制在 18 到 60 个字
+- \`bullets\`：如果是列表模板，返回 2 到 4 条要点，否则返回空数组
+- \`highlight\`：该页最值得被记住的一句短话，控制在 6 到 16 个字，可为空字符串
+- \`imagePrompt\`：如果需要辅助背景图，给出精准中文提示词；如果不需要，返回空字符串
+- \`imageType\`：\`real\` / \`ai\` / \`none\`
+6. 只有封面页和极少数页面允许使用图片辅助；大多数页面应以纯文字信息卡为主。
+7. 如果素材里存在可复用原图，封面页优先考虑 \`imageType: "real"\`；如果纯文字卡更稳，也可以直接用 \`none\`。
+8. 总说明文案（caption）控制在 80 到 160 字，口语化、结论先行，不要长篇展开。
+9. 结尾补充 4 到 6 个适合小红书语境的话题标签。
+10. 不要输出 Markdown，不要输出解释，只返回 JSON。
+
+【输出格式】：
+你的回复必须是纯 JSON：
+{"title":"笔记标题","caption":"短说明文案","hashtags":["标签1","标签2"],"slides":[{"role":"cover","template":"cover-poster","title":"封面主标题","body":"封面副标题","bullets":[],"highlight":"适合谁看","imagePrompt":"办公室氛围感背景","imageType":"real"}]}
+
+只能返回 JSON，不要附加解释。`;
+        }
+
+        if (contentFormat === 'html') {
+            return `你现在是一个爆款文章的资深内容主理人，同时也是一个严格遵守模板的 HTML 编辑器。
+
+【你的写作风格要求】：
+${stylePrompt}
+
+【HTML 模板】（模板仅供参考，灵活采用。）：
+${templateHtml}
+
+【模板补充说明】：
+${templateNotes || '无额外备注'}
+
+【排版与配图法则】：
+1. 必须保留模板主体结构、内联样式、模块顺序和视觉层级。
+2. 必须直接输出完整 HTML，不要输出 Markdown，不要输出代码块围栏。
+3. 模板中的示例文案要替换成真实内容，但不要删除关键模块。
+4. 所有图片节点必须保留在 HTML 中，且 \`src\` 使用占位符：
+- 真实素材图：\`[real-image-详细描述]\`
+- AI 生成图：\`[ai-image-详细精准的视觉画面描述]\`
+5. 如果素材中存在可复用原图，至少优先使用 1 张 \`[real-image-...]\`。
+6. 不要填写真实图片 URL，不要省略图片节点，不要输出脚本标签。
+
+【输出格式】：
+严格按下面格式返回，不要输出 JSON，不要输出 Markdown 代码块，不要附加解释：
+TITLE_START
+这里写文章标题
+TITLE_END
+HTML_START
+这里写完整 HTML
+HTML_END`;
+        }
+
+        return `你现在是一个爆款文章的资深内容主理人。
+
+【你的写作风格要求】：
+${stylePrompt}
+
+【排版与配图法则】：
+你在文章中需要穿插 2 到 3 张配图。根据内容需求选择合适的配图类型：
+- 产品截图、数据图表、真实场景照片 → 使用 \`[real-image-详细描述]\`
+- 概念图、创意插图、抽象表达 → 使用 \`[ai-image-详细精准的视觉画面描述]\`
+
+重要规则：如果参考素材里存在“有可复用原图”的素材，必须优先至少使用 1 张 \`[real-image-...]\`；只有确实需要概念插图时才使用 \`[ai-image-...]\`。
+
+【输出格式】：
+你的回复必须是纯 JSON：
+{"title":"文章标题","content":"Markdown 正文（包含图片占位符）"}
+
+只能返回 JSON，不要附加解释。`;
+    }
+
+    private buildUserPrompt(params: {
+        contentType: ArticleContentType;
+        topicTitle: string;
+        topicSummary: string;
+        keywords: string[];
+        materialContents: string;
+        templateNotes: string;
+        retryReason?: string;
+    }): string {
+        const retryInstruction = params.retryReason
+            ? `\n【上次输出失败原因】：${params.retryReason}
+【本次补充要求】：
+1. 必须从头输出完整成稿，不要续写半截内容。
+2. ${params.contentType === 'xiaohongshu' ? '不要遗漏标题、开场钩子、核心观点和结尾标签。' : '必须覆盖模板中的全部模块，尤其不要省略底部总结、CTA、互动区等尾部结构。'}
+3. 如果输出过长，请压缩单段文案长度，而不是删除核心结构。\n`
+            : '';
+
+        return `【选题核心方向】：${params.topicTitle}
+
+【选题分析或摘要】：${params.topicSummary}
+【相关关键词】：${params.keywords.join(', ')}
+【模板注意事项】：${params.templateNotes || '无'}
+${retryInstruction}
+
+以下是收集到的客观事实素材（请将它们内化为你的“独立观察”，用你的口吻表达出来，禁忌重复“基于素材”等新闻机器人的废话）：
+
+${params.materialContents}`;
+    }
+
+    private async generateXiaohongshuNote(params: {
+        modelId: string;
+        stylePrompt: string;
+        topicTitle: string;
+        topicSummary: string;
+        keywords: string[];
+        materialContents: string;
+        materialInfos: MaterialInfo[];
+        imageStylePrompt?: string;
+        imageStyleParams?: { ratio?: string; resolution?: string };
+        imageCreationEnabled: boolean;
+    }): Promise<XiaohongshuNoteData> {
+        const aiResponseText = await this.aiClient.generate(
+            params.modelId,
+            [
+                {
+                    role: 'system',
+                    content: this.buildSystemPrompt('xiaohongshu', params.stylePrompt, 'markdown', '', ''),
+                },
+                {
+                    role: 'user',
+                    content: this.buildUserPrompt({
+                        contentType: 'xiaohongshu',
+                        topicTitle: params.topicTitle,
+                        topicSummary: params.topicSummary,
+                        keywords: params.keywords,
+                        materialContents: params.materialContents,
+                        templateNotes: '',
+                    }),
+                },
+            ],
+            {
+                temperature: 0.8,
+                maxTokens: 5000,
+            },
+        );
+
+        const payload = this.parseXiaohongshuPayload(aiResponseText, params.topicTitle);
+        const imageParams = {
+            ...params.imageStyleParams,
+            ratio: '3:4',
+        };
+
+        const slides = await Promise.all(
+            payload.slides.map(async (slide, index) => {
+                const imageUrl = params.imageCreationEnabled && slide.imageType !== 'none' && slide.imagePrompt
+                    ? await this.imageSelector.selectImage(
+                        slide.imageType,
+                        slide.imagePrompt,
+                        params.materialInfos,
+                        params.imageStylePrompt,
+                        imageParams,
+                    ).catch(() => null)
+                    : null;
+
+                const cardSvg = renderXiaohongshuCardSvg({
+                    role: slide.role,
+                    template: slide.template,
+                    title: slide.title,
+                    body: slide.body,
+                    bullets: slide.bullets,
+                    highlight: slide.highlight,
+                    imageType: slide.imageType,
+                    backgroundImageUrl: imageUrl,
+                    pageNumber: index + 1,
+                    totalPages: payload.slides.length,
+                });
+                const cardImageUrl = await this.renderXiaohongshuCardPng(cardSvg, index);
+
+                return {
+                    ...slide,
+                    coverText: slide.title,
+                    bodyText: slide.body,
+                    imageUrl,
+                    backgroundImageUrl: imageUrl,
+                    cardImageUrl,
+                };
+            }),
+        );
+
+        return {
+            title: payload.title,
+            caption: payload.caption,
+            hashtags: payload.hashtags,
+            slides,
+        };
+    }
+
+    private parseXiaohongshuPayload(aiResponseText: string, fallbackTitle: string): GeneratedXiaohongshuPayload {
+        const cleanedText = this.stripCodeFence(aiResponseText.trim());
+
+        let parsedPayload: Record<string, unknown> | null = null;
+        try {
+            parsedPayload = JSON.parse(cleanedText) as Record<string, unknown>;
+        } catch (error) {
+            const message = error instanceof Error ? error.message : '未知错误';
+            this.logger.error(`小红书 JSON 解析失败: ${message}`);
+            throw new Error('AI 未按要求返回小红书卡片 JSON');
+        }
+
+        const rawSlides = Array.isArray(parsedPayload?.slides) ? parsedPayload.slides : [];
+        const slides = rawSlides
+            .map((slide, index) => this.normalizeXiaohongshuSlide(slide, index))
+            .filter((slide): slide is XiaohongshuSlidePlan => Boolean(slide));
+
+        if (slides.length < 5) {
+            throw new Error('小红书卡片数量不足，至少需要 5 张卡片');
+        }
+
+        const hashtags = Array.isArray(parsedPayload?.hashtags)
+            ? parsedPayload.hashtags.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean)
+            : [];
+
+        return {
+            title: this.normalizeTextValue(parsedPayload?.title, fallbackTitle),
+            caption: this.normalizeTextValue(parsedPayload?.caption, ''),
+            hashtags: hashtags.slice(0, 8),
+            slides: slides.slice(0, 9),
+        };
+    }
+
+    private normalizeXiaohongshuSlide(slide: unknown, index: number): XiaohongshuSlidePlan | null {
+        if (!slide || typeof slide !== 'object') {
+            return null;
+        }
+
+        const record = slide as Record<string, unknown>;
+        const title = this.clampXiaohongshuText(this.normalizeTextValue(record.title, this.normalizeTextValue(record.coverText, '')).trim(), index === 0 ? 22 : 24);
+        const body = this.clampXiaohongshuText(this.normalizeTextValue(record.body, this.normalizeTextValue(record.bodyText, '')).trim(), index === 0 ? 46 : 88);
+        const bullets = Array.isArray(record.bullets)
+            ? record.bullets.filter((item): item is string => typeof item === 'string').map((item) => this.clampXiaohongshuText(item.trim(), 30)).filter(Boolean).slice(0, 4)
+            : [];
+        const highlight = this.clampXiaohongshuText(this.normalizeTextValue(record.highlight, '').trim(), 18);
+        const imagePrompt = this.clampXiaohongshuText(this.normalizeTextValue(record.imagePrompt, '').trim(), 40);
+        const rawImageType = record.imageType === 'real' ? 'real' : record.imageType === 'none' ? 'none' : 'ai';
+        const role = index === 0 ? 'cover' : this.normalizeXiaohongshuRole(record.role, index);
+        const template = index === 0 ? 'cover-poster' : this.normalizeXiaohongshuTemplate(record.template, role, bullets, index);
+        const imageType = imagePrompt ? rawImageType : 'none';
+
+        if (!title || (!body && bullets.length === 0)) {
+            return null;
+        }
+
+        return {
+            role,
+            template,
+            title,
+            body,
+            bullets,
+            highlight,
+            imagePrompt,
+            imageType,
+        };
+    }
+
+    private clampXiaohongshuText(value: string, maxChars: number): string {
+        const normalized = value.replace(/\s+/g, ' ').trim();
+        const chars = Array.from(normalized);
+        if (chars.length <= maxChars) {
+            return normalized;
+        }
+
+        return `${chars.slice(0, Math.max(1, maxChars - 1)).join('').replace(/[.。…！!？?，,；;：: ]+$/g, '')}…`;
+    }
+
+    private normalizeXiaohongshuRole(value: unknown, index: number): XiaohongshuSlideRole {
+        const role = typeof value === 'string' ? value.trim() : '';
+        const fallbackRoles: XiaohongshuSlideRole[] = ['cover', 'hook', 'problem', 'solution', 'method', 'summary', 'cta'];
+        const normalizedRole = fallbackRoles.find((item) => item === role);
+        return normalizedRole || fallbackRoles[Math.min(index, fallbackRoles.length - 1)];
+    }
+
+    private normalizeXiaohongshuTemplate(
+        value: unknown,
+        role: XiaohongshuSlideRole,
+        bullets: string[],
+        index: number,
+    ): XiaohongshuSlideTemplate {
+        const template = typeof value === 'string' ? value.trim() : '';
+        const availableTemplates: XiaohongshuSlideTemplate[] = ['cover-poster', 'insight-card', 'bullet-list', 'checklist-card', 'summary-card'];
+        const normalized = availableTemplates.find((item) => item === template);
+        if (normalized) {
+            return normalized;
+        }
+
+        if (index === 0 || role === 'cover') {
+            return 'cover-poster';
+        }
+        if (role === 'summary' || role === 'cta') {
+            return 'summary-card';
+        }
+        if (bullets.length >= 3) {
+            return role === 'method' ? 'checklist-card' : 'bullet-list';
+        }
+
+        return 'insight-card';
+    }
+
+    private async renderXiaohongshuCardPng(svg: string, index: number): Promise<string> {
+        try {
+            const pngBuffer = await sharp(Buffer.from(svg)).png().toBuffer();
+            const uploadedUrl = await this.qiniuService.uploadBuffer(pngBuffer, 'png', 'xiaohongshu-cards');
+            if (uploadedUrl) {
+                return uploadedUrl;
+            }
+
+            return `data:image/png;base64,${pngBuffer.toString('base64')}`;
+        } catch (error) {
+            const message = error instanceof Error ? error.message : '未知错误';
+            this.logger.warn(`第 ${index + 1} 张小红书卡图转 PNG 失败，回退 SVG：${message}`);
+            return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+        }
+    }
+
+    private buildXiaohongshuContent(caption: string, hashtags: string[]): string {
+        const tagLine = hashtags.length > 0 ? hashtags.map((tag) => tag.startsWith('#') ? tag : `#${tag}`).join(' ') : '';
+        return [caption.trim(), tagLine].filter(Boolean).join('\n\n');
+    }
+
+    private getContentLabel(contentType: ArticleContentType): string {
+        return contentType === 'xiaohongshu' ? '小红书笔记' : '文章';
+    }
+
+    private getDefaultStylePrompt(contentType: ArticleContentType): string {
+        if (contentType === 'xiaohongshu') {
+            return '你是一个懂选题、懂情绪价值、懂口语化表达的小红书内容创作者，请写出真实、有观点、有传播感的中文笔记。';
+        }
+
+        return '你是一个专业的内容创作者，请清晰、逻辑严密地撰写文章。';
+    }
+
+
+    private async generateArticlePayload(params: {
+        modelId: string;
+        systemPrompt: string;
+        userPrompt: string;
+        fallbackTitle: string;
+        contentFormat: ArticleContentFormat;
+        templateHtml: string;
+    }): Promise<GeneratedArticlePayload> {
+        let lastReason = '';
+
+        for (let attempt = 1; attempt <= ARTICLE_MAX_GENERATION_ATTEMPTS; attempt++) {
+            const finalUserPrompt = attempt === 1
+                ? params.userPrompt
+                : `${params.userPrompt}\n\n【重试要求】：${lastReason || '上次输出不完整'}\n请重新完整输出整篇文章。`;
+
+            const aiResponseText = await this.aiClient.generate(
+                params.modelId,
+                [
+                    { role: 'system', content: params.systemPrompt },
+                    { role: 'user', content: finalUserPrompt },
+                ],
+                {
+                    temperature: 0.7,
+                    maxTokens: params.contentFormat === 'html' ? ARTICLE_HTML_MAX_TOKENS : ARTICLE_MARKDOWN_MAX_TOKENS,
+                },
+            );
+
+            const articleData = this.parseArticlePayload(aiResponseText, params.fallbackTitle, params.contentFormat);
+            if (!articleData.content || !articleData.title) {
+                throw new Error('大语言模型未能按要求生成文章正文和标题');
+            }
+
+            if (params.contentFormat !== 'html') {
+                return articleData;
+            }
+
+            const validation = this.validateHtmlArticle(articleData.content, params.templateHtml);
+            if (validation.isComplete) {
+                return articleData;
+            }
+
+            const continuedContent = await this.tryContinueHtmlArticle({
+                modelId: params.modelId,
+                systemPrompt: params.systemPrompt,
+                userPrompt: params.userPrompt,
+                fallbackTitle: articleData.title || params.fallbackTitle,
+                incompleteContent: articleData.content,
+                templateHtml: params.templateHtml,
+                validationReason: validation.reason,
+            });
+            if (continuedContent) {
+                return {
+                    ...articleData,
+                    content: continuedContent,
+                };
+            }
+
+            lastReason = validation.reason;
+            const warnMsg = `HTML 文章生成第 ${attempt} 次校验未通过：${validation.reason}`;
+            this.logger.warn(warnMsg);
+            await this.systemLogsService.record(warnMsg, 'warning');
+        }
+
+        throw new Error(`AI 返回的 HTML 不完整：${lastReason || '未通过完整性校验'}`);
+    }
+
+    private parseArticlePayload(aiResponseText: string, fallbackTitle: string, contentFormat: ArticleContentFormat): GeneratedArticlePayload {
+        const cleanedText = this.stripCodeFence(aiResponseText.trim());
+
+        if (contentFormat === 'html') {
+            const blockTitle = this.extractBetween(cleanedText, 'TITLE_START', 'TITLE_END');
+            const blockHtml = this.extractBetween(cleanedText, 'HTML_START', 'HTML_END');
+            if (blockTitle.trim() && blockHtml.trim()) {
+                return {
+                    title: blockTitle.trim(),
+                    content: blockHtml.trim(),
+                    contentFormat,
+                };
+            }
+        }
+
+        let parsedPayload: Record<string, unknown> | null = null;
+
+        try {
+            parsedPayload = JSON.parse(cleanedText) as Record<string, unknown>;
+        } catch (error) {
+            const message = error instanceof Error ? error.message : '未知错误';
+            this.logger.error(`AI JSON 解析失败，进入容错提取: ${message}`);
+        }
+
+        const title = this.normalizeTextValue(
+            parsedPayload?.title,
+            this.extractFieldByRegex(cleanedText, 'title') || fallbackTitle
+        );
+
+        const candidates = contentFormat === 'html'
+            ? ['rawHtml', 'html', 'content']
+            : ['content', 'rawHtml', 'html'];
+
+        let content = '';
+        for (const key of candidates) {
+            const value = this.normalizeTextValue(parsedPayload?.[key], '');
+            if (value.trim()) {
+                content = value;
+                break;
+            }
+            const extracted = this.extractFieldTolerantly(cleanedText, key);
+            if (extracted.trim()) {
+                content = extracted;
+                break;
+            }
+        }
+
+        if (!content.trim() && contentFormat === 'html') {
+            content = this.extractHtmlFragment(cleanedText);
+        }
+
+        if (!content.trim()) {
+            this.logger.warn('正文抽取失败，将直接保存 AI 原始返回');
+            content = cleanedText;
+        }
+
+        return {
+            title,
+            content: this.unescapeModelText(content),
+            contentFormat,
+        };
+    }
+
+    private async tryContinueHtmlArticle(params: {
+        modelId: string;
+        systemPrompt: string;
+        userPrompt: string;
+        fallbackTitle: string;
+        incompleteContent: string;
+        templateHtml: string;
+        validationReason: string;
+    }): Promise<string | null> {
+        const continuationMsg = `HTML 初稿疑似截断，尝试基于同一轮上下文续写补全。原因：${params.validationReason}`;
+        this.logger.warn(continuationMsg);
+        await this.systemLogsService.record(continuationMsg, 'warning');
+
+        const aiResponseText = await this.aiClient.generate(
+            params.modelId,
+            [
+                { role: 'system', content: params.systemPrompt },
+                { role: 'user', content: params.userPrompt },
+                {
+                    role: 'assistant',
+                    content: this.buildHtmlAssistantSnapshot(params.fallbackTitle, params.incompleteContent),
+                },
+                {
+                    role: 'user',
+                    content: this.buildHtmlContinuationPrompt(params.validationReason, params.incompleteContent),
+                },
+            ],
+            {
+                temperature: 0.3,
+                maxTokens: ARTICLE_HTML_CONTINUATION_MAX_TOKENS,
+            },
+        );
+
+        const standaloneHtml = this.extractStandaloneHtml(aiResponseText);
+        if (standaloneHtml) {
+            const standaloneValidation = this.validateHtmlArticle(standaloneHtml, params.templateHtml);
+            if (standaloneValidation.isComplete) {
+                const successMsg = 'HTML 续写补全返回了完整成稿，直接采用补全结果';
+                this.logger.log(successMsg);
+                await this.systemLogsService.record(successMsg, 'info');
+                return standaloneHtml;
+            }
+        }
+
+        const continuation = this.extractHtmlContinuation(aiResponseText);
+        if (!continuation) {
+            const warnMsg = 'HTML 续写补全未提取到有效片段，将回退到整篇重生成';
+            this.logger.warn(warnMsg);
+            await this.systemLogsService.record(warnMsg, 'warning');
+            return null;
+        }
+
+        const mergedContent = this.mergeHtmlContinuation(params.incompleteContent, continuation);
+        const mergedValidation = this.validateHtmlArticle(mergedContent, params.templateHtml);
+        if (mergedValidation.isComplete) {
+            const successMsg = 'HTML 截断内容已通过续写补全恢复完整';
+            this.logger.log(successMsg);
+            await this.systemLogsService.record(successMsg, 'info');
+            return mergedContent;
+        }
+
+        const warnMsg = `HTML 续写补全后仍未通过校验：${mergedValidation.reason}`;
+        this.logger.warn(warnMsg);
+        await this.systemLogsService.record(warnMsg, 'warning');
+        return null;
+    }
+
+    private normalizeTextValue(value: unknown, fallback: string): string {
+        return typeof value === 'string' ? value : fallback;
+    }
+
+    private buildHtmlAssistantSnapshot(title: string, incompleteContent: string): string {
+        return `TITLE_START
+${title}
+TITLE_END
+HTML_START
+${incompleteContent}
+HTML_END`;
+    }
+
+    private buildHtmlContinuationPrompt(validationReason: string, incompleteContent: string): string {
+        const tailPreview = incompleteContent.trim().slice(-800);
+        return `你上一条消息里的 HTML 没有输出完整，失败原因是：${validationReason}
+
+请严格基于你刚才已经写出的内容继续往后补全，不要重写标题，不要重复前文，不要从头再写。
+
+【补全要求】：
+1. 只输出“剩余缺失的 HTML 片段”。
+2. 需要把未闭合的结构补齐，并完整收尾。
+3. 不要输出解释，不要输出 Markdown 代码块。
+4. 如果你判断上一条内容其实已经不适合续写，可以直接从头输出一份完整 HTML。
+
+【上一段结尾参考】：
+${tailPreview}
+
+【输出格式】：
+如果输出剩余片段，请严格使用：
+HTML_CONTINUATION_START
+这里写剩余 HTML 片段
+HTML_CONTINUATION_END
+
+如果输出完整 HTML，请严格使用：
+HTML_START
+这里写完整 HTML
+HTML_END`;
+    }
+
+    private stripCodeFence(source: string): string {
+        return source.replace(/^```(?:json|html)?\n/i, '').replace(/\n```$/i, '').trim();
+    }
+
+    private extractBetween(source: string, startToken: string, endToken: string): string {
+        const startIndex = source.indexOf(startToken);
+        if (startIndex === -1) {
+            return '';
+        }
+
+        const contentStart = startIndex + startToken.length;
+        const endIndex = source.indexOf(endToken, contentStart);
+        if (endIndex === -1) {
+            return '';
+        }
+
+        return source.slice(contentStart, endIndex).trim();
+    }
+
+    private extractFieldByRegex(source: string, field: string): string {
+        const regex = new RegExp(`"${field}"\\s*:\\s*"([\\s\\S]*?)"(?:\\s*,|\\s*})`, 'i');
+        const match = source.match(regex);
+        return match ? match[1] : '';
+    }
+
+    private extractStandaloneHtml(source: string): string {
+        const cleanedText = this.stripCodeFence(source.trim());
+        const blockHtml = this.extractBetween(cleanedText, 'HTML_START', 'HTML_END');
+        if (blockHtml.trim()) {
+            return this.unescapeModelText(blockHtml.trim());
+        }
+
+        const extractedHtml = this.extractHtmlFragment(cleanedText);
+        return extractedHtml ? this.unescapeModelText(extractedHtml.trim()) : '';
+    }
+
+    private extractHtmlContinuation(source: string): string {
+        const cleanedText = this.stripCodeFence(source.trim());
+        const continuationBlock = this.extractBetween(cleanedText, 'HTML_CONTINUATION_START', 'HTML_CONTINUATION_END');
+        if (continuationBlock.trim()) {
+            return this.unescapeModelText(continuationBlock.trim());
+        }
+
+        const standaloneHtml = this.extractBetween(cleanedText, 'HTML_START', 'HTML_END');
+        if (standaloneHtml.trim()) {
+            return this.unescapeModelText(standaloneHtml.trim());
+        }
+
+        return '';
+    }
+
+    private mergeHtmlContinuation(incompleteContent: string, continuation: string): string {
+        const base = incompleteContent.trimEnd();
+        const extra = continuation.trim();
+
+        if (!extra) {
+            return base;
+        }
+
+        if (base.includes(extra)) {
+            return base;
+        }
+
+        if (extra.includes(base) && extra.length > base.length) {
+            return extra;
+        }
+
+        const maxOverlap = Math.min(base.length, extra.length, 1200);
+        for (let size = maxOverlap; size >= 20; size--) {
+            if (base.slice(-size) === extra.slice(0, size)) {
+                return `${base}${extra.slice(size)}`;
+            }
+        }
+
+        return `${base}\n${extra}`;
+    }
+
+    private extractFieldTolerantly(source: string, field: string): string {
+        const fieldIndex = source.indexOf(`"${field}"`);
+        if (fieldIndex === -1) {
+            return '';
+        }
+
+        const colonIndex = source.indexOf(':', fieldIndex);
+        if (colonIndex === -1) {
+            return '';
+        }
+
+        let valueStart = colonIndex + 1;
+        while (valueStart < source.length && /\s/.test(source[valueStart])) {
+            valueStart++;
+        }
+
+        if (source[valueStart] !== '"') {
+            return '';
+        }
+
+        valueStart += 1;
+
+        const nextKnownField = this.findNextKnownFieldIndex(source, valueStart);
+        if (nextKnownField !== -1) {
+            const candidate = source.slice(valueStart, nextKnownField).trimEnd();
+            return candidate.replace(/",?\s*$/, '');
+        }
+
+        const closingBraceIndex = source.lastIndexOf('}');
+        if (closingBraceIndex !== -1 && closingBraceIndex > valueStart) {
+            const candidate = source.slice(valueStart, closingBraceIndex).trimEnd();
+            return candidate.replace(/"\s*$/, '');
+        }
+
+        return source.slice(valueStart).trim();
+    }
+
+    private findNextKnownFieldIndex(source: string, fromIndex: number): number {
+        const candidates = ['"rawHtml"', '"html"', '"content"', '"title"']
+            .map((token) => source.indexOf(`,${token}`, fromIndex))
+            .filter((index) => index !== -1);
+
+        return candidates.length > 0 ? Math.min(...candidates) : -1;
+    }
+
+    private extractHtmlFragment(source: string): string {
+        const htmlStartTokens = ['<section', '<article', '<div', '<main'];
+        const positions = htmlStartTokens
+            .map((token) => source.indexOf(token))
+            .filter((index) => index !== -1);
+
+        if (positions.length === 0) {
+            return '';
+        }
+
+        const start = Math.min(...positions);
+        const candidate = source.slice(start).trim();
+        return candidate.replace(/"\s*}\s*$/, '').trim();
+    }
+
+    private unescapeModelText(content: string): string {
+        return content
+            .replace(/\\n/g, '\n')
+            .replace(/\\"/g, '"')
+            .replace(/\\\\/g, '\\');
+    }
+
+    private validateHtmlArticle(content: string, templateHtml: string): HtmlValidationResult {
+        const normalizedContent = content.trim();
+        if (!normalizedContent) {
+            return { isComplete: false, reason: 'HTML 正文为空' };
+        }
+
+        if (!/<(section|article|div|main)\b/i.test(normalizedContent)) {
+            return { isComplete: false, reason: '未检测到有效 HTML 结构' };
+        }
+
+        if (!/(<\/section>|<\/article>|<\/div>|<\/main>)\s*$/i.test(normalizedContent)) {
+            return { isComplete: false, reason: 'HTML 结尾缺少闭合标签，疑似被截断' };
+        }
+
+        const openingSections = (normalizedContent.match(/<section\b/gi) || []).length;
+        const closingSections = (normalizedContent.match(/<\/section>/gi) || []).length;
+        if (openingSections > 0 && closingSections < Math.max(1, openingSections - 2)) {
+            return { isComplete: false, reason: 'section 标签闭合数量明显不足，疑似被截断' };
+        }
+
+        const tailAnchors = this.extractTemplateAnchors(templateHtml);
+        if (tailAnchors.length > 0) {
+            const missingAnchor = tailAnchors.find((anchor) => !normalizedContent.includes(anchor));
+            if (missingAnchor) {
+                return { isComplete: false, reason: `缺少模板尾部锚点：${missingAnchor}` };
+            }
+        }
+
+        const lastLine = normalizedContent.split('\n').filter(Boolean).pop() || normalizedContent;
+        if (!/[>）】。”"'”’]$/.test(lastLine.trim())) {
+            return { isComplete: false, reason: 'HTML 结尾像是半句截断' };
+        }
+
+        return { isComplete: true, reason: '' };
+    }
+
+    private extractTemplateAnchors(templateHtml: string): string[] {
+        const commentAnchors = [...templateHtml.matchAll(/<!--\s*([\s\S]*?)\s*-->/g)]
+            .map((match) => match[1].replace(/\s+/g, ' ').trim())
+            .filter((anchor) => anchor.length >= 4);
+
+        return commentAnchors.slice(-3);
+    }
+
+    private readTemplateNotes(parameters: unknown): string {
+        if (!parameters || typeof parameters !== 'object') {
+            return '';
+        }
+
+        const maybeNotes = (parameters as Record<string, unknown>).notes;
+        if (typeof maybeNotes === 'string') {
+            return maybeNotes;
+        }
+
+        return '';
+    }
+
+    private async generateCoverImage(params: {
+        topicTitle: string;
+        topicSummary: string;
+        keywords: string[];
+        imageStylePrompt?: string;
+        imageStyleParams?: { ratio?: string; resolution?: string };
+        imageCreationEnabled: boolean;
+    }): Promise<string | null> {
+        if (!params.imageCreationEnabled) {
+            const warnMsg = `选题「${params.topicTitle}」未配置图片模型，跳过独立封面生成`;
+            this.logger.warn(warnMsg);
+            await this.systemLogsService.record(warnMsg, 'warning');
+            return null;
+        }
+
+        const coverPrompt = this.buildCoverImagePrompt(params.topicTitle, params.topicSummary, params.keywords);
+        const infoMsg = `选题「${params.topicTitle}」开始独立生成 AI 封面图...`;
+        this.logger.log(infoMsg);
+        await this.systemLogsService.record(infoMsg, 'info');
+
+        try {
+            const coverImage = await this.imageSelector.generateCoverImage(
+                coverPrompt,
+                params.imageStylePrompt,
+                params.imageStyleParams,
+            );
+
+            if (coverImage) {
+                const successMsg = `选题「${params.topicTitle}」独立封面生成成功`;
+                this.logger.log(successMsg);
+                await this.systemLogsService.record(successMsg, 'success');
+            }
+
+            return coverImage;
+        } catch (error) {
+            const message = error instanceof Error ? error.message : '未知错误';
+            const warnMsg = `选题「${params.topicTitle}」独立封面生成失败：${message}`;
+            this.logger.warn(warnMsg);
+            await this.systemLogsService.record(warnMsg, 'warning');
+            return null;
+        }
+    }
+
+    private buildCoverImagePrompt(topicTitle: string, topicSummary: string, keywords: string[]): string {
+        const safeSummary = topicSummary.trim() || '无摘要';
+        const keywordText = keywords.length > 0 ? keywords.join('、') : '无';
+
+        return `请为下面这篇文章生成一张“公众号封面图”，这不是正文插图，而是用于文章头图的独立视觉。
+
+【文章标题】
+${topicTitle}
+
+【文章摘要】
+${safeSummary}
+
+【关键词】
+${keywordText}
+
+【封面要求】
+1. 画面必须有强烈主视觉，要吸引人。
+2. 最好包含核心关键词/标题，但不能文字太多。
+3. 不要做成正文配图拼贴，不要做成多宫格截图。`;
+    }
+
+    private async renderImages(params: {
+        content: string;
+        contentFormat: ArticleContentFormat;
+        materialInfos: MaterialInfo[];
+        imageStylePrompt?: string;
+        imageStyleParams?: { ratio?: string; resolution?: string };
+        imageCreationEnabled: boolean;
+        topicTitle: string;
+    }): Promise<{ content: string; coverImage: string | null }> {
+        let renderedContent = params.content;
+
+        const realImageRegex = /\[real-image-([^\]]+)\]/g;
+        const aiImageRegex = /\[ai-image-([^\]]+)\]/g;
+        const legacyImageRegex = /\[image-([^\]]+)\]/g;
+
+        const availableRealImages = params.materialInfos.filter((m) => m.hasImage && m.imageUrl);
+
+        if (availableRealImages.length > 0) {
+            const currentRealMatches = [...renderedContent.matchAll(realImageRegex)];
+            const aiOrLegacyMatches = [
+                ...[...renderedContent.matchAll(aiImageRegex)].map((match) => ({ placeholder: match[0], prompt: match[1] })),
+                ...[...renderedContent.matchAll(legacyImageRegex)].map((match) => ({ placeholder: match[0], prompt: match[1] })),
+            ];
+
+            const desiredRealCount = Math.min(availableRealImages.length, Math.min(2, currentRealMatches.length + aiOrLegacyMatches.length));
+            const missingRealCount = Math.max(0, desiredRealCount - currentRealMatches.length);
+
+            if (missingRealCount > 0 && aiOrLegacyMatches.length > 0) {
+                for (let i = 0; i < Math.min(missingRealCount, aiOrLegacyMatches.length); i++) {
+                    const item = aiOrLegacyMatches[i];
+                    renderedContent = renderedContent.replace(item.placeholder, `[real-image-${item.prompt}]`);
+                }
+            }
+        }
+
+        if (params.imageCreationEnabled) {
+            const imageTasks: Promise<ImageTaskResult>[] = [];
+
+            for (const match of renderedContent.matchAll(realImageRegex)) {
+                const placeholder = match[0];
+                const prompt = match[1];
+                imageTasks.push(
+                    this.imageSelector.selectImage('real', prompt, params.materialInfos, params.imageStylePrompt, params.imageStyleParams)
+                        .then((url) => ({ placeholder, url, success: Boolean(url) }))
+                        .catch((error: Error) => ({ placeholder, url: null, success: false, errorDetail: error.message }))
+                );
+            }
+
+            for (const match of renderedContent.matchAll(aiImageRegex)) {
+                const placeholder = match[0];
+                const prompt = match[1];
+                imageTasks.push(
+                    this.imageSelector.selectImage('ai', prompt, params.materialInfos, params.imageStylePrompt, params.imageStyleParams)
+                        .then((url) => ({ placeholder, url, success: Boolean(url) }))
+                        .catch((error: Error) => ({ placeholder, url: null, success: false, errorDetail: error.message }))
+                );
+            }
+
+            for (const match of renderedContent.matchAll(legacyImageRegex)) {
+                const placeholder = match[0];
+                const prompt = match[1];
+                imageTasks.push(
+                    this.imageSelector.selectImage('ai', prompt, params.materialInfos, params.imageStylePrompt, params.imageStyleParams)
+                        .then((url) => ({ placeholder, url, success: Boolean(url) }))
+                        .catch((error: Error) => ({ placeholder, url: null, success: false, errorDetail: error.message }))
+                );
+            }
+
+            const imageMsg = `选题「${params.topicTitle}」嗅探到 ${imageTasks.length} 处图片插图，准备启动混合配图管线...`;
+            this.logger.log(imageMsg);
+            await this.systemLogsService.record(imageMsg, 'info');
+
+            const imageResults = await Promise.all(imageTasks);
+            for (const result of imageResults) {
+                if (result.success && result.url) {
+                    renderedContent = this.applyResolvedImage(renderedContent, result.placeholder, result.url, params.contentFormat);
+                } else {
+                    renderedContent = this.applyFailedImage(renderedContent, result.placeholder, result.errorDetail || '未知错误', params.contentFormat);
+                }
+            }
+        } else {
+            renderedContent = this.applyFailedImage(renderedContent, '[real-image-', '未配置画图模型', params.contentFormat, true);
+            renderedContent = this.applyFailedImage(renderedContent, '[ai-image-', '未配置画图模型', params.contentFormat, true);
+            renderedContent = this.applyFailedImage(renderedContent, '[image-', '未配置画图模型', params.contentFormat, true);
+        }
+
+        if (params.contentFormat === 'html') {
+            renderedContent = this.cleanupHtml(renderedContent);
+        }
+
+        return { content: renderedContent, coverImage: null };
+    }
+
+    private applyResolvedImage(content: string, placeholder: string, url: string, contentFormat: ArticleContentFormat): string {
+        if (contentFormat === 'html') {
+            return content.replaceAll(placeholder, url);
+        }
+
+        return content.replaceAll(placeholder, `![](${url})`);
+    }
+
+    private applyFailedImage(
+        content: string,
+        placeholder: string,
+        errorMessage: string,
+        contentFormat: ArticleContentFormat,
+        replaceByPattern = false,
+    ): string {
+        if (replaceByPattern) {
+            const pattern = contentFormat === 'html'
+                ? new RegExp(`\\[(?:real-image|ai-image|image)-[^\\]]+\\]`, 'g')
+                : new RegExp(`\\[(?:real-image|ai-image|image)-([^\\]]+)\\]`, 'g');
+
+            if (contentFormat === 'html') {
+                return content.replace(pattern, '');
+            }
+
+            return content.replace(pattern, (_match, prompt: string) => `\n> [未配置画图模型，本欲插图：${prompt}]\n`);
+        }
+
+        if (contentFormat === 'html') {
+            return content.replaceAll(placeholder, '');
+        }
+
+        return content.replaceAll(placeholder, `\n> [图片获取失败，原因：${errorMessage}]\n`);
+    }
+
+    private cleanupHtml(content: string): string {
+        return content
+            .replace(/<img\b([^>]*?)src=(['"])\s*\2([^>]*)>/gi, '')
+            .replace(/(<(?:p|div|section|article|blockquote|li|h[1-6])\b[^>]*>)\s+/gi, '$1')
+            .replace(/([\u3400-\u9FFF\uF900-\uFAFF，。！？；：、“”‘’（）《》【】])\s+(<(?:span|strong|em|b|i|a)\b[^>]*>)/g, '$1$2')
+            .replace(/(<\/(?:span|strong|em|b|i|a)>)\s+([\u3400-\u9FFF\uF900-\uFAFF，。！？；：、“”‘’（）《》【】])/g, '$1$2')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+    }
+}

@@ -1,0 +1,50 @@
+# dependencies
+**/node_modules/
+.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# testing
+**/coverage/
+
+# next.js (frontend)
+frontend/.next/
+frontend/out/
+
+# production
+**/build/
+**/dist/
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+*.log*
+.pnpm-debug.log*
+
+# local env files
+.env*.local
+backend/.env
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Persistence
+backend/data/*.db
+backend/data/*.db-journal
+

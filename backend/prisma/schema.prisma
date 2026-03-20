@@ -1,0 +1,344 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// 后台用户表
+model User {
+  id           String        @id @default(cuid())
+  username     String        @unique
+  email        String        @unique
+  passwordHash String        @map("password_hash")
+  name         String
+  status       String        @default("active") // active, disabled
+  lastLoginAt  DateTime?     @map("last_login_at")
+
+  sessions     UserSession[]
+
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@map("users")
+}
+
+// 后台登录会话表
+model UserSession {
+  id         String   @id @default(cuid())
+  userId     String   @map("user_id")
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String   @map("token_hash")
+  expiresAt  DateTime @map("expires_at")
+  lastUsedAt DateTime @default(now()) @map("last_used_at")
+
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("user_sessions")
+}
+
+// 内容策略表
+model ContentStrategy {
+  id               String   @id @default(cuid())
+  name             String   @unique
+  description      String?  @db.Text
+  industry         String   @default("通用")
+  targetAudience   String   @db.Text @map("target_audience")
+  commercialGoal   String   @db.Text @map("commercial_goal")
+  corePainPoints   String   @db.Text @map("core_pain_points")
+  writingAngles    String   @db.Text @map("writing_angles")
+  toneAndStyle     String?  @db.Text @map("tone_and_style")
+  isDefault        Boolean  @default(false) @map("is_default")
+  enabled          Boolean  @default(true)
+
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  @@index([isDefault])
+  @@index([enabled])
+  @@map("content_strategies")
+}
+
+// 素材表
+model Material {
+  id          String   @id @default(cuid())
+  title       String
+  content     String?  @db.Text
+  summary     String?  @db.Text
+  sourceUrl   String   @map("source_url")
+  platform    String   // 36Kr, Juejin, Zhihu, WeChat, Other
+  author      String   @default("")
+  publishDate DateTime? @map("publish_date")
+  collectDate DateTime @default(now()) @map("collect_date")
+  status      String   @default("unmined") // unmined, mined, failed
+  miningCount Int      @default(0) @map("mining_count") // 挖掘次数
+  keywords    String[] // PostgreSQL 数组类型
+  metadata    Json?
+
+  // 图片字段（素材配图）
+  imageUrl          String?  @map("image_url")          // 素材封面图 URL（七牛云 CDN）
+  originalImageUrl  String?  @map("original_image_url") // 原始图片 URL
+  hasImage          Boolean  @default(false)            // 是否有可用图片
+
+  topics      TopicMaterial[]
+
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@index([collectDate])
+  @@index([platform])
+  @@index([hasImage])
+  @@map("materials")
+}
+
+// 选题表
+model Topic {
+  id              String   @id @default(cuid())
+  title           String
+  description     String?  @db.Text
+  summary         String?  @db.Text
+  sourceType      String   @default("外部采集") @map("source_type")
+  keywords        String[]
+
+  aiScore         Float?   @map("ai_score")
+  scoreDetails    Json?    @map("score_details")
+  scoreReason     String?  @db.Text @map("score_reason")
+  reasoning       String?  @db.Text // 商业转化分析（详细版）
+  searchQueries   String[] @map("search_queries") // AI 建议的搜索词组
+
+  status          String   @default("pending") // pending, generating, completed
+  isPublished     Boolean  @default(false) @map("is_published")
+
+  materials       TopicMaterial[]
+  articles        Article[]
+
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@index([isPublished])
+  @@index([createdAt])
+  @@map("topics")
+}
+
+// 选题-素材 多对多关联表
+model TopicMaterial {
+  topicId    String @map("topic_id")
+  topic      Topic  @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  materialId String @map("material_id")
+  material   Material @relation(fields: [materialId], references: [id], onDelete: Cascade)
+
+  @@id([topicId, materialId])
+  @@map("topic_materials")
+}
+
+// 文章表
+model Article {
+  id          String   @id @default(cuid())
+  topicId     String?  @map("topic_id")
+  topic       Topic?   @relation(fields: [topicId], references: [id], onDelete: SetNull)
+
+  title       String
+  content     String   @db.Text
+  contentType String   @default("article") @map("content_type") // article, xiaohongshu
+  contentFormat String @default("markdown") @map("content_format") // markdown, html
+  xiaohongshuData Json? @map("xiaohongshu_data")
+  rawHtml     String?  @db.Text @map("raw_html") // AI 产出的原始 HTML（含图片占位符）
+  finalHtml   String?  @db.Text @map("final_html") // 图片替换后的最终 HTML
+
+  templateId  String?  @map("template_id")
+  template    Style?   @relation("ArticleTemplate", fields: [templateId], references: [id], onDelete: SetNull)
+
+  styleId     String?  @map("style_id")
+  style       Style?   @relation("ArticleWritingStyle", fields: [styleId], references: [id], onDelete: SetNull)
+
+  modelId     String?  @map("model_id")
+  model       AIModel? @relation(fields: [modelId], references: [id], onDelete: SetNull)
+
+  status      String   @default("draft") // draft, published
+  coverImage  String?  @map("cover_image") // 封面图 URL
+
+  publishRecords PublishRecord[]
+
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@index([topicId])
+  @@index([contentType])
+  @@index([templateId])
+  @@map("articles")
+}
+
+// 信息源配置表
+model Source {
+  id            String   @id @default(cuid())
+  name          String
+  type          String   // rss, api, crawler
+  url           String
+  config        Json?
+  enabled       Boolean  @default(true)
+  lastCrawlTime DateTime? @map("last_crawl_time")
+
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@index([enabled])
+  @@map("sources")
+}
+
+// 风格管理表
+model Style {
+  id              String   @id @default(cuid())
+  name            String   @unique
+  description     String?  @db.Text
+  promptTemplate  String   @db.Text @map("prompt_template")
+  parameters      Json?
+  isDefault       Boolean  @default(false) @map("is_default")
+  type            String   @default("article") // article, image, template, xiaohongshu
+
+  articles        Article[] @relation("ArticleWritingStyle")
+  templatedArticles Article[] @relation("ArticleTemplate")
+
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@index([type])
+
+  @@map("styles")
+}
+
+// AI 平台表
+model AIPlatform {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  baseUrl     String   @map("base_url")
+  apiKey      String   @map("api_key")
+  enabled     Boolean  @default(true)
+  config      Json?
+
+  models      AIModel[]
+
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("ai_platforms")
+}
+
+// AI 模型配置表
+model AIModel {
+  id          String   @id @default(cuid())
+  name        String
+  modelId     String   @map("model_id")
+
+  platformId  String   @map("platform_id")
+  platform    AIPlatform @relation(fields: [platformId], references: [id], onDelete: Cascade)
+
+  enabled     Boolean  @default(true)
+  config      Json?
+
+  articles    Article[]
+
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@unique([platformId, modelId])
+  @@map("ai_models")
+}
+
+// 默认模型配置表
+model DefaultModelConfig {
+  id              String   @id @default(cuid())
+  purpose         String   @unique // article_creation, image_creation, x_collection, topic_selection
+  modelId         String   @map("model_id")
+
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("default_model_configs")
+}
+
+// 计划任务配置表
+model ScheduleConfig {
+  id          String   @id @default(cuid())
+  taskType    String   @unique @map("task_type") // collect_materials, mine_materials, create_articles
+  cronExpr    String   @map("cron_expr") // Cron 表达式
+  enabled     Boolean  @default(false)
+  config      Json?    // 针对每个任务的额外配置 (如：单次处理数量、平台等)
+  lastRunTime DateTime? @map("last_run_time")
+
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("schedule_configs")
+}
+
+// 系统运行日志表
+model SystemLog {
+  id        String   @id @default(cuid())
+  level     String   @default("info") // info, warning, error, success
+  content   String   @db.Text
+  
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@index([level])
+  @@map("system_logs")
+}
+
+// 发布账号配置表
+model PublishAccount {
+  id          String   @id @default(cuid())
+  platform    String   // wechat, zhihu, juejin, xiaohongshu
+  name        String   // 账号名称或备注
+  appId       String?  @map("app_id") // 对应 authorizer_appid
+  apiToken    String?  @map("api_token") // 第三方 API 鉴权 Token 等
+  config      Json?    // 其他配置信息 (如 cookie/密钥)
+
+  records     PublishRecord[]
+
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("publish_accounts")
+}
+
+// 发布记录表
+model PublishRecord {
+  id          String   @id @default(cuid())
+  
+  articleId   String   @map("article_id")
+  article     Article  @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  
+  accountId   String   @map("account_id")
+  account     PublishAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  
+  platform    String   // wechat 等
+  status      String   @default("pending") // pending, success, failed
+  publishUrl  String?  @map("publish_url") // 发布的文章外部链接或外部 ID
+  errorMessage String? @db.Text @map("error_message") // 报错信息记录
+  
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([articleId])
+  @@index([accountId])
+  @@index([status])
+  @@map("publish_records")
+}
+
+// 系统配置表（key-value 结构，用于存储七牛云等系统级参数）
+model SystemConfig {
+  key       String   @id
+  value     String   @db.Text
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("system_configs")
+}
